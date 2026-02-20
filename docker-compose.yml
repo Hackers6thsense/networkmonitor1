@@ -1,23 +1,23 @@
 version: "3.8"
 services:
   zookeeper:
-    image: confluentinc/cp-zookeeper:7.5.0
+    image: confluentinc/cp-zookeeper:latest
     container_name: zookeeper
     environment:
       ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
     ports:
       - "2181:2181"
 
   kafka:
-    image: confluentinc/cp-kafka:7.5.0
+    image: confluentinc/cp-kafka:latest
     container_name: kafka
     depends_on:
       - zookeeper
     environment:
       KAFKA_BROKER_ID: 1
       KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT
-      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092
+      KAFKA_LISTENERS: PLAINTEXT://kafka:9092
       KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
     ports:
@@ -35,65 +35,215 @@ services:
     volumes:
       - neo4j_data:/data
 
+  asset_discovery:
+    build:
+      context: .
+      dockerfile: ./sensors/asset_discovery/Dockerfile
+    container_name: asset_discovery
+    environment:
+      NETWORK_RANGE: "192.168.1.0/24"
+      SCAN_INTERVAL_SECONDS: 900
+      KAFKA_BOOTSTRAP: "kafka:9092"
+      KAFKA_TOPIC: "asset.discovery"
+    depends_on:
+      - kafka
+    # Uncomment to run interactively for debugging
+    # stdin_open: true
+    # tty: true
+
+  topology_updater:
+    build:
+      context: .
+      dockerfile: ./services/topology_updater/Dockerfile
+    container_name: topology_updater
+    environment:
+      KAFKA_BOOTSTRAP: "kafka:9092"
+      KAFKA_TOPIC: "asset.discovery"
+      NEO4J_URI: "bolt://neo4j:7687"
+      NEO4J_USER: "neo4j"
+      NEO4J_PASSWORD: "neo4jpassword"
+    depends_on:
+      - kafka
+      - neo4j
+
+  traffic_analysis:
+    build:
+      context: .
+      dockerfile: ./sensors/traffic_analysis/Dockerfile
+    container_name: traffic_analysis
+    environment:
+      INTERFACE: "eth0"
+      FLOW_WINDOW_SECONDS: 30
+      KAFKA_BOOTSTRAP: "kafka:9092"
+      KAFKA_TOPIC: "netflow"
+    depends_on:
+      - kafka
+    network_mode: "host"
+
+  encrypted_traffic_analysis:
+    build:
+      context: .
+      dockerfile: ./sensors/encrypted_traffic_analysis/Dockerfile
+    container_name: encrypted_traffic_analysis
+    environment:
+      INTERFACE: "eth0"
+      KAFKA_BOOTSTRAP: "kafka:9092"
+      KAFKA_TOPIC: "tls.meta"
+    depends_on:
+      - kafka
+    network_mode: "host"
+
   suricata:
-    image: jasonish/suricata:latest
+    build:
+      context: .
+      dockerfile: ./sensors/suricata_custom/Dockerfile
     container_name: suricata
     network_mode: "host"
+    environment:
+      ET_PRO_API_KEY: ${ET_PRO_API_KEY:-}
     volumes:
       - suricata_logs:/var/log/suricata
-    command: ["-i", "eth0"]
+
+  ids_alert_forwarder:
+    build:
+      context: .
+      dockerfile: ./sensors/ids_alert_forwarder/Dockerfile
+    container_name: ids_alert_forwarder
+    environment:
+      EVE_FILE: "/var/log/suricata/eve.json"
+      KAFKA_BOOTSTRAP: "kafka:9092"
+      KAFKA_TOPIC: "security.alerts"
+    volumes:
+      - suricata_logs:/var/log/suricata:ro
+    depends_on:
+      - kafka
+      - suricata
+
+  ksqldb-server:
+    image: confluentinc/ksqldb-server:latest
+    container_name: ksqldb-server
+    depends_on:
+      - kafka
+    environment:
+      KSQL_CONFIG_DIR: "/etc/ksqldb"
+      KSQL_BOOTSTRAP_SERVERS: "kafka:9092"
+      KSQL_LISTENERS: "http://0.0.0.0:8088"
+      KSQL_KSQL_SCHEMA_REGISTRY_URL: "http://schema-registry:8081"
+    ports:
+      - "8088:8088"
+
+  ksqldb-cli:
+    image: confluentinc/ksqldb-cli:latest
+    container_name: ksqldb-cli
+    depends_on:
+      - ksqldb-server
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        echo "Waiting for ksqlDB server..." && \
+        while ! nc -z ksqldb-server 8088; do sleep 1; done; \
+        echo "Bootstrapping ksqlDB..." && \
+        ksql http://ksqldb-server:8088 < /init.sql && \
+        tail -f /dev/null
+    volumes:
+      - ./stream_aggregation/init.sql:/init.sql:ro
+
+  alert_sink_neo4j:
+    build:
+      context: .
+      dockerfile: ./services/alert_sink_neo4j/Dockerfile
+    container_name: alert_sink_neo4j
+    environment:
+      KAFKA_BOOTSTRAP: "kafka:9092"
+      KAFKA_TOPIC: "alert.correlated"
+      NEO4J_URI: "bolt://neo4j:7687"
+      NEO4J_USER: "neo4j"
+      NEO4J_PASSWORD: "neo4jpassword"
+    depends_on:
+      - kafka
+      - neo4j
 
   zeek:
     image: blacktop/zeek:latest
     container_name: zeek
     network_mode: "host"
-    command: ["-i", "eth0"]
+    command: ["-i", "eth0", "-C", "Local::enable_local_scripts=F", "LogAscii::json=T"]
     volumes:
       - zeek_logs:/usr/local/zeek/logs
 
-  ids-alert-forwarder:
-    image: python:3.11-slim
-    container_name: ids-alert-forwarder
-    network_mode: "host"
-    depends_on:
-      - kafka
-      - suricata
+  dpi_event_forwarder:
+    build:
+      context: .
+      dockerfile: ./sensors/dpi_event_forwarder/Dockerfile
+    container_name: dpi_event_forwarder
     volumes:
-      - suricata_logs:/var/log/suricata:ro
-      - ./scripts:/app
+      - zeek_logs:/usr/local/zeek/logs:ro
     environment:
-      KAFKA_BOOTSTRAP: kafka:9092
-      EVE_FILE: /var/log/suricata/eve.json
-      KAFKA_TOPIC: security.alerts
-    command: ["pip", "install", "kafka-python", "watchdog", "&&", "python", "/app/ids-alert-forwarder.py"]
-
-  alert-sink-neo4j:
-    image: python:3.11-slim
-    container_name: alert-sink-neo4j
+      LOG_DIR: "/usr/local/zeek/logs/current"
+      KAFKA_BOOTSTRAP: "kafka:9092"
+      KAFKA_TOPIC: "dpi.events"
     depends_on:
       - kafka
-      - neo4j
+      - zeek
+
+  geoip_enricher:
+    build:
+      context: .
+      dockerfile: ./services/geoip_enricher/Dockerfile
+    container_name: geoip_enricher
+    environment:
+      KAFKA_BOOTSTRAP: "kafka:9092"
+      IN_TOPIC: "netflow"
+      OUT_TOPIC: "geo.events"
+      EXTRA_TOPICS: "security.alerts,dpi.events"
+      HTTP_PORT: 5000
     volumes:
-      - ./scripts:/app
-    environment:
-      KAFKA_BOOTSTRAP: kafka:9092
-      KAFKA_TOPIC: security.alerts
-      NEO4J_URI: bolt://neo4j:7687
-      NEO4J_USER: neo4j
-      NEO4J_PASSWORD: neo4jpassword
-    command: ["pip", "install", "kafka-python", "neo4j", "&&", "python", "/app/alert-sink-neo4j.py"]
-
-  kafka-ui:
-    image: provectuslabs/kafka-ui:latest
-    container_name: kafka-ui
+      - ./GeoLite2-City.mmdb:/geoip/GeoLite2-City.mmdb:ro
     depends_on:
       - kafka
-    environment:
-      KAFKA_CLUSTERS_0_NAME: local
-      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
-      KAFKA_CLUSTERS_0_ZOOKEEPER: zookeeper:2181
+
+  ui:
+    build:
+      context: .
+      dockerfile: ./ui/Dockerfile
+    container_name: ui
     ports:
-      - "8080:8080"
+      - "8080:80"
+    depends_on:
+      - geoip_enricher
+
+  soar_blocker:
+    build:
+      context: .
+      dockerfile: ./services/soar_blocker/Dockerfile
+    container_name: soar_blocker
+    environment:
+      KAFKA_BOOTSTRAP: "kafka:9092"
+      IDS_TOPIC: "security.alerts"
+      UEBA_TOPIC: "ueba.alerts"
+      SEVERITY_THRESHOLD: 2
+      ANOMALY_THRESHOLD: 0.5
+      BLOCKLIST_CMD: "echo 'iptables -A INPUT -s {ip} -j DROP'"
+    depends_on:
+      - kafka
+
+  packet_launcher:
+    build:
+      context: .
+      dockerfile: ./services/packet_launcher/Dockerfile
+    container_name: packet_launcher
+    network_mode: "host"
+    environment:
+      ENABLE_PACKET_LAUNCHER: "${ENABLE_PACKET_LAUNCHER:-false}"
+      LAUNCH_TOKEN: "${LAUNCH_TOKEN:-}"
+      KAFKA_BOOTSTRAP: "kafka:9092"
+    cap_add:
+      - NET_RAW
+      - NET_ADMIN
+    ports:
+      - "7000:7000"
+    depends_on:
+      - kafka
 
 volumes:
   neo4j_data:
