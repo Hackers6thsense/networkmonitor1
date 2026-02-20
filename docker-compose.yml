@@ -43,6 +43,14 @@ services:
       - suricata_logs:/var/log/suricata
     command: ["-i", "eth0"]
 
+  zeek:
+    image: blacktop/zeek:latest
+    container_name: zeek
+    network_mode: "host"
+    command: ["-i", "eth0"]
+    volumes:
+      - zeek_logs:/usr/local/zeek/logs
+
   kafka-ui:
     image: provectuslabs/kafka-ui:latest
     container_name: kafka-ui
@@ -58,3 +66,4 @@ services:
 volumes:
   neo4j_data:
   suricata_logs:
+  zeek_logs:
