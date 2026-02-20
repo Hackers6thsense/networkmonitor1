@@ -5,7 +5,6 @@ services:
     container_name: zookeeper
     environment:
       ZOOKEEPER_CLIENT_PORT: 2181
-      ZOOKEEPER_TICK_TIME: 2000
     ports:
       - "2181:2181"
 
@@ -36,5 +35,14 @@ services:
     volumes:
       - neo4j_data:/data
 
+  suricata:
+    image: jasonish/suricata:latest
+    container_name: suricata
+    network_mode: "host"
+    volumes:
+      - suricata_logs:/var/log/suricata
+    command: ["-i", "eth0"]
+
 volumes:
   neo4j_data:
+  suricata_logs:
