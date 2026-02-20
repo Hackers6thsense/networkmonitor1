@@ -43,6 +43,18 @@ services:
       - suricata_logs:/var/log/suricata
     command: ["-i", "eth0"]
 
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: kafka-ui
+    depends_on:
+      - kafka
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+      KAFKA_CLUSTERS_0_ZOOKEEPER: zookeeper:2181
+    ports:
+      - "8080:8080"
+
 volumes:
   neo4j_data:
   suricata_logs:
